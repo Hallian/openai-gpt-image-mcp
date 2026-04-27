@@ -272,6 +272,13 @@ describe("loadEnvFile", () => {
     assert.equal(process.env.TEST_LOAD_I, "");
     delete process.env.TEST_LOAD_I;
   });
+
+  test("unclosed single quote is kept as-is", () => {
+    const envPath = writeEnv("TEST_LOAD_QUOTE='unclosed");
+    loadEnvFile(envPath);
+    assert.equal(process.env.TEST_LOAD_QUOTE, "'unclosed");
+    delete process.env.TEST_LOAD_QUOTE;
+  });
 });
 
 // ─── absolutePathCheck ───────────────────────────────────────────────────────

@@ -13,6 +13,6 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "tsc && node --test dist/utils.test.js"
+    "test": "tsc && node --test dist/utils.test.js dist/image-helpers.test.js"
   }
 }

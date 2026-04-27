@@ -8,6 +8,17 @@ import { OpenAI, AzureOpenAI, toFile } from "openai";
 import fs from "fs";
 import path from "path";
 import { loadEnvFile, validateSize, absolutePathCheck, base64Check } from "./utils";
+import {
+  validateCreateImageArgs,
+  buildCreateImageParams,
+  mapCreateImageResponse,
+  mapEditImageResponse,
+  resolveOutputTarget,
+  resolveFilePaths,
+  parseMimeFromExtension,
+  parseBase64DataUrl,
+  buildEditImageParams,
+} from "./image-helpers";
 
 // Parse command line arguments for --env-file
 const cmdArgs = process.argv.slice(2);
@@ -77,100 +88,52 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
     "create-image",
     (createImageSchema as any)._def.schema.shape,
     async (args, _extra) => {
-      // If AZURE_OPENAI_API_KEY is defined, use the AzureOpenAI class
       const openai = process.env.AZURE_OPENAI_API_KEY ? new AzureOpenAI() : new OpenAI();
 
       const {
-        prompt,
-        background,
         model = "gpt-image-1",
-        moderation,
-        n,
-        output_compression,
+        background,
         output_format,
-        quality,
-        size,
-        user,
         output = "base64",
-        file_output: file_outputRaw,
+        file_output,
       } = args;
-      const file_output: string | undefined = file_outputRaw;
 
-      if (model === "gpt-image-2" && background === "transparent") {
-        throw new Error("gpt-image-2 does not support transparent backgrounds.");
-      }
+      validateCreateImageArgs({ model, background, output_format });
+      validateSize(args.size, model);
 
-      if (background === "transparent" && output_format && !["png", "webp"].includes(output_format)) {
-        throw new Error("If background is 'transparent', output_format must be 'png' or 'webp'");
-      }
-
-      validateSize(size, model);
-
-      const imageParams: any = {
-        prompt,
+      const imageParams = buildCreateImageParams({
+        prompt: args.prompt,
         model,
-        ...(background && model === "gpt-image-1" ? { background } : {}),
-        ...(moderation ? { moderation } : {}),
-        ...(n ? { n } : {}),
-        ...(output_format ? { output_format } : {}),
-        ...(quality ? { quality } : {}),
-        ...(size ? { size } : {}),
-        ...(user ? { user } : {}),
-      };
-      if (
-        typeof output_compression !== "undefined" &&
-        output_format &&
-        ["webp", "jpeg"].includes(output_format)
-      ) {
-        imageParams.output_compression = output_compression;
-      }
+        background,
+        moderation: args.moderation,
+        n: args.n,
+        output_compression: args.output_compression,
+        output_format,
+        quality: args.quality,
+        size: args.size,
+        user: args.user,
+      });
 
-      const result = await openai.images.generate(imageParams);
+      const result = await openai.images.generate(imageParams as any);
+      const images = mapCreateImageResponse((result.data ?? []) as any, output_format);
 
-      const images = (result.data ?? []).map((img: any) => ({
-        b64: img.b64_json,
-        mimeType: output_format === "jpeg" ? "image/jpeg" : output_format === "webp" ? "image/webp" : "image/png",
-        ext: output_format === "jpeg" ? "jpg" : output_format === "webp" ? "webp" : "png",
-      }));
-
-      // Auto-switch to file_output if total base64 size exceeds 1MB
-      const MAX_RESPONSE_SIZE = 1048576; // 1MB
-      const totalBase64Size = images.reduce((sum, img) => sum + Buffer.byteLength(img.b64, "base64"), 0);
-      let effectiveOutput = output;
-      let effectiveFileOutput = file_output;
-      if (output === "base64" && totalBase64Size > MAX_RESPONSE_SIZE) {
-        effectiveOutput = "file_output";
-        if (!file_output) {
-          // Use /tmp or MCP_HF_WORK_DIR if set
-          const tmpDir = process.env.MCP_HF_WORK_DIR || "/tmp";
-          const unique = Date.now();
-          effectiveFileOutput = path.join(tmpDir, `openai_image_${unique}.${images[0]?.ext ?? "png"}`);
-        }
-      }
+      const { effectiveOutput, effectiveFileOutput } = resolveOutputTarget({
+        output,
+        file_output: file_output as string | undefined,
+        images,
+        filenamePrefix: "openai_image",
+        workDir: process.env.MCP_HF_WORK_DIR,
+      });
 
       if (effectiveOutput === "file_output") {
-        const fs = await import("fs/promises");
-        const path = await import("path");
-        // If multiple images, append index to filename
-        const basePath = effectiveFileOutput!;
+        const filePaths = resolveFilePaths(effectiveFileOutput!, images, false);
         const responses = [];
         for (let i = 0; i < images.length; i++) {
-          const img = images[i];
-          let filePath = basePath;
-          if (images.length > 1) {
-            const parsed = path.parse(basePath);
-            filePath = path.join(parsed.dir, `${parsed.name}_${i + 1}.${img.ext ?? "png"}`);
-          } else {
-            // Ensure correct extension
-            const parsed = path.parse(basePath);
-            filePath = path.join(parsed.dir, `${parsed.name}.${img.ext ?? "png"}`);
-          }
-          await fs.writeFile(filePath, Buffer.from(img.b64, "base64"));
-          responses.push({ type: "text", text: `Image saved to: file://${filePath}` });
+          await fs.promises.writeFile(filePaths[i], Buffer.from(images[i].b64, "base64"));
+          responses.push({ type: "text", text: `Image saved to: file://${filePaths[i]}` });
         }
         return { content: responses };
       } else {
-        // Default: base64
         return {
           content: images.map((img) => ({
             type: "image",
@@ -181,11 +144,6 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
       }
     }
   );
-
-  const imageInputSchema = z.string().refine(
-    (val) => absolutePathCheck(val) || base64Check(val),
-    { message: "Must be an absolute path or a base64-encoded string (optionally as a data URL)" }
-  ).describe("Absolute path to an image file (png, jpg, webp < 25MB) or a base64-encoded image string.");
 
   // Base schema without refinement for server.tool signature
   const editImageBaseSchema = z.object({
@@ -219,12 +177,10 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
   // Edit Image Tool
   server.tool(
     "edit-image",
-    editImageBaseSchema.shape, // <-- Use the base schema shape here
+    editImageBaseSchema.shape,
     async (args, _extra) => {
-      // Validate arguments using the full schema with refinements
       const validatedArgs = editImageSchema.parse(args);
 
-      // Explicitly validate image and mask inputs here
       if (!absolutePathCheck(validatedArgs.image) && !base64Check(validatedArgs.image)) {
         throw new Error("Invalid 'image' input: Must be an absolute path or a base64-encoded string.");
       }
@@ -249,111 +205,59 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
 
       validateSize(size, model);
 
-      // Helper to convert input (path or base64) to toFile
       async function inputToFile(input: string, idx = 0) {
         if (absolutePathCheck(input)) {
-          // File path: infer mime type from extension
-          const ext = input.split('.').pop()?.toLowerCase();
-          let mime = "image/png";
-          if (ext === "jpg" || ext === "jpeg") mime = "image/jpeg";
-          else if (ext === "webp") mime = "image/webp";
-          else if (ext === "png") mime = "image/png";
-          // else default to png
+          const mime = parseMimeFromExtension(input);
           return await toFile(fs.createReadStream(input), undefined, { type: mime });
         } else {
-          // Base64 or data URL
-          let base64 = input;
-          let mime = "image/png";
-          if (input.startsWith("data:image/")) {
-            // data URL
-            const match = input.match(/^data:(image\/\w+);base64,(.*)$/);
-            if (match) {
-              mime = match[1];
-              base64 = match[2];
-            }
-          }
+          const { base64, mime } = parseBase64DataUrl(input);
           const buffer = Buffer.from(base64, "base64");
           return await toFile(buffer, `input_${idx}.${mime.split("/")[1] || "png"}`, { type: mime });
         }
       }
 
-      // Prepare image input
       const imageFile = await inputToFile(imageInput, 0);
-
-      // Prepare mask input
       const maskFile = maskInput ? await inputToFile(maskInput, 1) : undefined;
 
-      // Construct parameters for OpenAI API
-      const editParams: any = {
-        image: imageFile,
+      const editParams = buildEditImageParams({
         prompt,
         model,
-        ...(maskFile ? { mask: maskFile } : {}),
-        ...(n ? { n } : {}),
-        ...(quality ? { quality } : {}),
-        ...(size ? { size } : {}),
-        ...(user ? { user } : {}),
-        // response_format is not applicable (always b64_json)
-      };
+        n,
+        quality,
+        size,
+        user,
+        imageFile,
+        maskFile,
+      });
 
-      const result = await openai.images.edit(editParams);
+      const result = await openai.images.edit(editParams as any);
+      const images = mapEditImageResponse((result.data ?? []) as any);
 
-      // We need to determine the output mime type and extension based on input/defaults
-      // Since OpenAI doesn't return this for edits, we'll default to png
-      const images = (result.data ?? []).map((img: any) => ({
-        b64: img.b64_json,
-        mimeType: "image/png",
-        ext: "png",
-      }));
-
-      // Auto-switch to file_output if total base64 size exceeds 1MB
-      const MAX_RESPONSE_SIZE = 1048576; // 1MB
-      const totalBase64Size = images.reduce((sum, img) => sum + Buffer.byteLength(img.b64, "base64"), 0);
-      let effectiveOutput = output;
-      let effectiveFileOutput = file_output;
-      if (output === "base64" && totalBase64Size > MAX_RESPONSE_SIZE) {
-        effectiveOutput = "file_output";
-        if (!file_output) {
-          // Use /tmp or MCP_HF_WORK_DIR if set
-          const tmpDir = process.env.MCP_HF_WORK_DIR || "/tmp";
-          const unique = Date.now();
-          effectiveFileOutput = path.join(tmpDir, `openai_image_edit_${unique}.png`);
-        }
-      }
+      const { effectiveOutput, effectiveFileOutput } = resolveOutputTarget({
+        output,
+        file_output,
+        images,
+        filenamePrefix: "openai_image_edit",
+        workDir: process.env.MCP_HF_WORK_DIR,
+      });
 
       if (effectiveOutput === "file_output") {
         if (!effectiveFileOutput) {
           throw new Error("file_output path is required when output is 'file_output'");
         }
-        // Use fs/promises and path (already imported)
-        const basePath = effectiveFileOutput!;
+        const filePaths = resolveFilePaths(effectiveFileOutput, images, true);
         const responses = [];
         for (let i = 0; i < images.length; i++) {
-          const img = images[i];
-          let filePath = basePath;
-          if (images.length > 1) {
-            const parsed = path.parse(basePath);
-            // Append index before the original extension if it exists, otherwise just append index and .png
-            const ext = parsed.ext || `.${img.ext}`;
-            filePath = path.join(parsed.dir, `${parsed.name}_${i + 1}${ext}`);
-          } else {
-            // Ensure the extension from the path is used, or default to .png
-            const parsed = path.parse(basePath);
-            const ext = parsed.ext || `.${img.ext}`;
-            filePath = path.join(parsed.dir, `${parsed.name}${ext}`);
-          }
-          await fs.promises.writeFile(filePath, Buffer.from(img.b64, "base64"));
-          // Workaround: Return file path as text
-          responses.push({ type: "text", text: `Image saved to: file://${filePath}` });
+          await fs.promises.writeFile(filePaths[i], Buffer.from(images[i].b64, "base64"));
+          responses.push({ type: "text", text: `Image saved to: file://${filePaths[i]}` });
         }
         return { content: responses };
       } else {
-        // Default: base64
         return {
           content: images.map((img) => ({
             type: "image",
             data: img.b64,
-            mimeType: img.mimeType, // Should be image/png
+            mimeType: img.mimeType,
           })),
         };
       }
@@ -362,4 +266,4 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-})(); 
+})();
