@@ -152,6 +152,6 @@ MIT
 ## 🙏 Credits
 
 - Built with [@modelcontextprotocol/sdk](https://www.npmjs.com/package/@modelcontextprotocol/sdk)
-- Uses [openai](https://www.npmjs.com/package/openai) Node.js SDK 
+- Uses [openai](https://www.npmjs.com/package/openai) Node.js SDK
 - Built by [SureScale.ai](https://surescale.ai)
 - Contributions from [Axle Research and Technology](https://axleinfo.com/)
