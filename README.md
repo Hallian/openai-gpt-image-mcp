@@ -155,3 +155,4 @@ MIT
 - Uses [openai](https://www.npmjs.com/package/openai) Node.js SDK
 - Built by [SureScale.ai](https://surescale.ai)
 - Contributions from [Axle Research and Technology](https://axleinfo.com/)
+- Contributions from [Vend](https://vend.com/) and [Nikolas Lahtinen](https://nikolas.lahtinen.org)
