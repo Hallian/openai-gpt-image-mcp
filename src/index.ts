@@ -52,17 +52,60 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
     }
   });
 
+  function validateSize(size: string | undefined, model: string): void {
+    if (!size || size === "auto") return;
+
+    const GPT_IMAGE_1_SIZES = ["1024x1024", "1536x1024", "1024x1536"];
+    if (model === "gpt-image-1") {
+      if (!GPT_IMAGE_1_SIZES.includes(size)) {
+        throw new Error(
+          `Invalid size '${size}' for gpt-image-1. Must be one of: ${GPT_IMAGE_1_SIZES.join(", ")}, or 'auto'.`
+        );
+      }
+      return;
+    }
+
+    const match = size.match(/^(\d+)x(\d+)$/);
+    if (!match) {
+      throw new Error(`Invalid size format '${size}'. Expected 'WxH' (e.g., '1024x1024') or 'auto'.`);
+    }
+    const width = parseInt(match[1], 10);
+    const height = parseInt(match[2], 10);
+
+    if (width % 16 !== 0 || height % 16 !== 0) {
+      throw new Error(`Both dimensions must be multiples of 16. Got ${width}x${height}.`);
+    }
+    if (width > 3840 || height > 3840) {
+      throw new Error(`Maximum edge size is 3840px. Got ${width}x${height}.`);
+    }
+    const totalPixels = width * height;
+    if (totalPixels < 655360 || totalPixels > 8294400) {
+      throw new Error(
+        `Total pixels must be between 655,360 and 8,294,400. Got ${totalPixels} (${width}x${height}).`
+      );
+    }
+    const aspectRatio = Math.max(width, height) / Math.min(width, height);
+    if (aspectRatio > 3) {
+      throw new Error(`Aspect ratio must be at most 3:1. Got ${aspectRatio.toFixed(2)}:1 (${width}x${height}).`);
+    }
+  }
+
   // Zod schema for create-image tool input
   const createImageSchema = z.object({
     prompt: z.string().max(32000),
     background: z.enum(["transparent", "opaque", "auto"]).optional(),
-    model: z.literal("gpt-image-1").default("gpt-image-1"),
+    model: z.enum(["gpt-image-1", "gpt-image-2"]).default("gpt-image-1"),
     moderation: z.enum(["auto", "low"]).optional(),
     n: z.number().int().min(1).max(10).optional(),
     output_compression: z.number().int().min(0).max(100).optional(),
     output_format: z.enum(["png", "jpeg", "webp"]).optional(),
     quality: z.enum(["auto", "high", "medium", "low"]).optional(),
-    size: z.enum(["1024x1024", "1536x1024", "1024x1536", "auto"]).optional(),
+    size: z.string().optional().describe(
+      "Image size. For gpt-image-1: '1024x1024', '1536x1024', '1024x1536', or 'auto'. " +
+      "For gpt-image-2: any 'WxH' where both dimensions are multiples of 16, max edge 3840px, " +
+      "aspect ratio up to 3:1, total pixels between 655360 and 8294400. Common presets: " +
+      "'1024x1024', '1536x1024', '1024x1536', '1792x1024', '2048x2048'."
+    ),
     user: z.string().optional(),
     output: z.enum(["base64", "file_output"]).default("base64"),
     file_output: z.string().optional().refine(
@@ -97,7 +140,6 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
       // If AZURE_OPENAI_API_KEY is defined, use the AzureOpenAI class
       const openai = process.env.AZURE_OPENAI_API_KEY ? new AzureOpenAI() : new OpenAI();
 
-      // Only allow gpt-image-1
       const {
         prompt,
         background,
@@ -114,16 +156,20 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
       } = args;
       const file_output: string | undefined = file_outputRaw;
 
-      // Enforce: if background is 'transparent', output_format must be 'png' or 'webp'
+      if (model === "gpt-image-2" && background === "transparent") {
+        throw new Error("gpt-image-2 does not support transparent backgrounds.");
+      }
+
       if (background === "transparent" && output_format && !["png", "webp"].includes(output_format)) {
         throw new Error("If background is 'transparent', output_format must be 'png' or 'webp'");
       }
 
-      // Only include output_compression if output_format is webp or jpeg
+      validateSize(size, model);
+
       const imageParams: any = {
         prompt,
         model,
-        ...(background ? { background } : {}),
+        ...(background && model === "gpt-image-1" ? { background } : {}),
         ...(moderation ? { moderation } : {}),
         ...(n ? { n } : {}),
         ...(output_format ? { output_format } : {}),
@@ -141,7 +187,6 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
 
       const result = await openai.images.generate(imageParams);
 
-      // gpt-image-1 always returns base64 images in data[].b64_json
       const images = (result.data ?? []).map((img: any) => ({
         b64: img.b64_json,
         mimeType: output_format === "jpeg" ? "image/jpeg" : output_format === "webp" ? "image/webp" : "image/png",
@@ -197,7 +242,7 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
     }
   );
 
-  // Zod schema for edit-image tool input (gpt-image-1 only)
+  // Zod schema for edit-image tool input
   const absolutePathCheck = (val: string | undefined) => {
     if (!val) return true;
     // Check for Unix/Linux/macOS absolute paths
@@ -217,10 +262,14 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
     image: z.string().describe("Absolute image path or base64 string to edit."),
     prompt: z.string().max(32000).describe("A text description of the desired edit. Max 32000 chars."),
     mask: z.string().optional().describe("Optional absolute path or base64 string for a mask image (png < 4MB, same dimensions as the first image). Fully transparent areas indicate where to edit."),
-    model: z.literal("gpt-image-1").default("gpt-image-1"),
+    model: z.enum(["gpt-image-1", "gpt-image-2"]).default("gpt-image-1"),
     n: z.number().int().min(1).max(10).optional().describe("Number of images to generate (1-10)."),
-    quality: z.enum(["auto", "high", "medium", "low"]).optional().describe("Quality (high, medium, low) - only for gpt-image-1."),
-    size: z.enum(["1024x1024", "1536x1024", "1024x1536", "auto"]).optional().describe("Size of the generated images."),
+    quality: z.enum(["auto", "high", "medium", "low"]).optional().describe("Quality level: auto, high, medium, or low."),
+    size: z.string().optional().describe(
+      "Image size. For gpt-image-1: '1024x1024', '1536x1024', '1024x1536', or 'auto'. " +
+      "For gpt-image-2: any 'WxH' where both dimensions are multiples of 16, max edge 3840px, " +
+      "aspect ratio up to 3:1, total pixels between 655360 and 8294400."
+    ),
     user: z.string().optional().describe("Optional user identifier for OpenAI monitoring."),
     output: z.enum(["base64", "file_output"]).default("base64").describe("Output format: base64 or file path."),
     file_output: z.string().refine(absolutePathCheck, { message: "Path must be absolute" }).optional()
@@ -237,7 +286,7 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
     { message: "file_output must be an absolute path when output is 'file_output'", path: ["file_output"] }
   );
 
-  // Edit Image Tool (gpt-image-1 only)
+  // Edit Image Tool
   server.tool(
     "edit-image",
     editImageBaseSchema.shape, // <-- Use the base schema shape here
@@ -265,8 +314,10 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
         user,
         output = "base64",
         file_output: file_outputRaw,
-      } = validatedArgs; // <-- Use validatedArgs here
+      } = validatedArgs;
       const file_output: string | undefined = file_outputRaw;
+
+      validateSize(size, model);
 
       // Helper to convert input (path or base64) to toFile
       async function inputToFile(input: string, idx = 0) {
@@ -306,18 +357,17 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
       const editParams: any = {
         image: imageFile,
         prompt,
-        model, // Always gpt-image-1
+        model,
         ...(maskFile ? { mask: maskFile } : {}),
         ...(n ? { n } : {}),
         ...(quality ? { quality } : {}),
         ...(size ? { size } : {}),
         ...(user ? { user } : {}),
-        // response_format is not applicable for gpt-image-1 (always b64_json)
+        // response_format is not applicable (always b64_json)
       };
 
       const result = await openai.images.edit(editParams);
 
-      // gpt-image-1 always returns base64 images in data[].b64_json
       // We need to determine the output mime type and extension based on input/defaults
       // Since OpenAI doesn't return this for edits, we'll default to png
       const images = (result.data ?? []).map((img: any) => ({
