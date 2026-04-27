@@ -12,6 +12,7 @@
     "openai": "^4.96.0"
   },
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "test": "tsc && node --test dist/utils.test.js"
   }
 }
