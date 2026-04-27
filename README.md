@@ -10,10 +10,11 @@
 
 ---
 
-A Model Context Protocol (MCP) tool server for OpenAI's GPT-4o/gpt-image-1 image generation and editing APIs.
+A Model Context Protocol (MCP) tool server for OpenAI's gpt-image-1 and gpt-image-2 image generation and editing APIs.
 
-- **Generate images** from text prompts using OpenAI's latest models.
+- **Generate images** from text prompts using OpenAI's latest models (gpt-image-1 and gpt-image-2).
 - **Edit images** (inpainting, outpainting, compositing) with advanced prompt control.
+- **gpt-image-2 support**: Custom resolutions up to 3840px, flexible aspect ratios up to 3:1.
 - **Supports**: Claude Desktop, Cursor, VSCode, Windsurf, and any MCP-compatible client.
 
 ---
@@ -61,7 +62,7 @@ Also supports Azure deployments:
     "openai-gpt-image-mcp": {
       "command": "node",
       "args": ["/absolute/path/to/dist/index.js"],
-      "env": { 
+      "env": {
         "AZURE_OPENAI_API_KEY": "sk-...",
         "AZURE_OPENAI_ENDPOINT": "my.endpoint.com",
         "OPENAI_API_VERSION": "2024-12-01-preview"
@@ -87,6 +88,16 @@ Also supports supplying an environment files:
 ---
 
 ## ⚡ Advanced
+
+### Model Selection
+
+Both tools default to `gpt-image-2`. Pass `model: "gpt-image-1"` to use the older model:
+
+- **gpt-image-2** supports custom image sizes (any `WxH` where both dimensions are multiples of 16, max edge 3840px, aspect ratio up to 3:1, total pixels between 655,360 and 8,294,400). Common sizes: `1024x1024`, `1536x1024`, `1792x1024`, `2048x2048`.
+- **gpt-image-2** does **not** support transparent backgrounds (the `background` parameter is ignored).
+- **gpt-image-1** only supports preset sizes: `1024x1024`, `1536x1024`, `1024x1536`, or `auto`.
+
+### Other Options
 
 - For `create-image`, set `n` to generate up to 10 images at once.
 - For `edit-image`, provide a mask image (file path or base64) to control where edits are applied.
@@ -141,6 +152,7 @@ MIT
 ## 🙏 Credits
 
 - Built with [@modelcontextprotocol/sdk](https://www.npmjs.com/package/@modelcontextprotocol/sdk)
-- Uses [openai](https://www.npmjs.com/package/openai) Node.js SDK 
+- Uses [openai](https://www.npmjs.com/package/openai) Node.js SDK
 - Built by [SureScale.ai](https://surescale.ai)
 - Contributions from [Axle Research and Technology](https://axleinfo.com/)
+- Contributions from [Vend](https://vend.com/) and [Nikolas Lahtinen](https://nikolas.lahtinen.org)

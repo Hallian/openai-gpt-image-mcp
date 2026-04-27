@@ -7,29 +7,18 @@ import { z } from "zod";
 import { OpenAI, AzureOpenAI, toFile } from "openai";
 import fs from "fs";
 import path from "path";
-
-// Function to load environment variables from a file
-const loadEnvFile = (filePath: string) => {
-  try {
-    const envConfig = fs.readFileSync(filePath, "utf8");
-    envConfig.split("\n").forEach((line) => {
-      const trimmedLine = line.trim();
-      if (trimmedLine && !trimmedLine.startsWith("#")) {
-        const [key, ...valueParts] = trimmedLine.split("=");
-        const value = valueParts.join("=").trim();
-        if (key) {
-          // Remove surrounding quotes if present
-          process.env[key.trim()] = value.startsWith("'") && value.endsWith("'") || value.startsWith("\"") && value.endsWith("\"")
-            ? value.slice(1, -1)
-            : value;
-        }
-      }
-    });
-    console.log(`Loaded environment variables from ${filePath}`);
-  } catch (error) {
-    console.warn(`Warning: Could not read environment file at ${filePath}:`, error);
-  }
-};
+import { loadEnvFile, validateSize, absolutePathCheck, base64Check } from "./utils";
+import {
+  validateCreateImageArgs,
+  buildCreateImageParams,
+  mapCreateImageResponse,
+  mapEditImageResponse,
+  resolveOutputTarget,
+  resolveFilePaths,
+  parseMimeFromExtension,
+  parseBase64DataUrl,
+  buildEditImageParams,
+} from "./image-helpers";
 
 // Parse command line arguments for --env-file
 const cmdArgs = process.argv.slice(2);
@@ -56,13 +45,18 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
   const createImageSchema = z.object({
     prompt: z.string().max(32000),
     background: z.enum(["transparent", "opaque", "auto"]).optional(),
-    model: z.literal("gpt-image-1").default("gpt-image-1"),
+    model: z.enum(["gpt-image-1", "gpt-image-2"]).default("gpt-image-2"),
     moderation: z.enum(["auto", "low"]).optional(),
     n: z.number().int().min(1).max(10).optional(),
     output_compression: z.number().int().min(0).max(100).optional(),
     output_format: z.enum(["png", "jpeg", "webp"]).optional(),
     quality: z.enum(["auto", "high", "medium", "low"]).optional(),
-    size: z.enum(["1024x1024", "1536x1024", "1024x1536", "auto"]).optional(),
+    size: z.string().optional().describe(
+      "Image size. For gpt-image-1: '1024x1024', '1536x1024', '1024x1536', or 'auto'. " +
+      "For gpt-image-2: any 'WxH' where both dimensions are multiples of 16, max edge 3840px, " +
+      "aspect ratio up to 3:1, total pixels between 655360 and 8294400. Common presets: " +
+      "'1024x1024', '1536x1024', '1024x1536', '1792x1024', '2048x2048'."
+    ),
     user: z.string().optional(),
     output: z.enum(["base64", "file_output"]).default("base64"),
     file_output: z.string().optional().refine(
@@ -94,98 +88,52 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
     "create-image",
     (createImageSchema as any)._def.schema.shape,
     async (args, _extra) => {
-      // If AZURE_OPENAI_API_KEY is defined, use the AzureOpenAI class
       const openai = process.env.AZURE_OPENAI_API_KEY ? new AzureOpenAI() : new OpenAI();
 
-      // Only allow gpt-image-1
       const {
-        prompt,
+        model = "gpt-image-2",
         background,
-        model = "gpt-image-1",
-        moderation,
-        n,
-        output_compression,
         output_format,
-        quality,
-        size,
-        user,
         output = "base64",
-        file_output: file_outputRaw,
+        file_output,
       } = args;
-      const file_output: string | undefined = file_outputRaw;
 
-      // Enforce: if background is 'transparent', output_format must be 'png' or 'webp'
-      if (background === "transparent" && output_format && !["png", "webp"].includes(output_format)) {
-        throw new Error("If background is 'transparent', output_format must be 'png' or 'webp'");
-      }
+      validateCreateImageArgs({ model, background, output_format });
+      validateSize(args.size, model);
 
-      // Only include output_compression if output_format is webp or jpeg
-      const imageParams: any = {
-        prompt,
+      const imageParams = buildCreateImageParams({
+        prompt: args.prompt,
         model,
-        ...(background ? { background } : {}),
-        ...(moderation ? { moderation } : {}),
-        ...(n ? { n } : {}),
-        ...(output_format ? { output_format } : {}),
-        ...(quality ? { quality } : {}),
-        ...(size ? { size } : {}),
-        ...(user ? { user } : {}),
-      };
-      if (
-        typeof output_compression !== "undefined" &&
-        output_format &&
-        ["webp", "jpeg"].includes(output_format)
-      ) {
-        imageParams.output_compression = output_compression;
-      }
+        background,
+        moderation: args.moderation,
+        n: args.n,
+        output_compression: args.output_compression,
+        output_format,
+        quality: args.quality,
+        size: args.size,
+        user: args.user,
+      });
 
-      const result = await openai.images.generate(imageParams);
+      const result = await openai.images.generate(imageParams as any);
+      const images = mapCreateImageResponse((result.data ?? []) as any, output_format);
 
-      // gpt-image-1 always returns base64 images in data[].b64_json
-      const images = (result.data ?? []).map((img: any) => ({
-        b64: img.b64_json,
-        mimeType: output_format === "jpeg" ? "image/jpeg" : output_format === "webp" ? "image/webp" : "image/png",
-        ext: output_format === "jpeg" ? "jpg" : output_format === "webp" ? "webp" : "png",
-      }));
-
-      // Auto-switch to file_output if total base64 size exceeds 1MB
-      const MAX_RESPONSE_SIZE = 1048576; // 1MB
-      const totalBase64Size = images.reduce((sum, img) => sum + Buffer.byteLength(img.b64, "base64"), 0);
-      let effectiveOutput = output;
-      let effectiveFileOutput = file_output;
-      if (output === "base64" && totalBase64Size > MAX_RESPONSE_SIZE) {
-        effectiveOutput = "file_output";
-        if (!file_output) {
-          // Use /tmp or MCP_HF_WORK_DIR if set
-          const tmpDir = process.env.MCP_HF_WORK_DIR || "/tmp";
-          const unique = Date.now();
-          effectiveFileOutput = path.join(tmpDir, `openai_image_${unique}.${images[0]?.ext ?? "png"}`);
-        }
-      }
+      const { effectiveOutput, effectiveFileOutput } = resolveOutputTarget({
+        output,
+        file_output: file_output as string | undefined,
+        images,
+        filenamePrefix: "openai_image",
+        workDir: process.env.MCP_HF_WORK_DIR,
+      });
 
       if (effectiveOutput === "file_output") {
-        const fs = await import("fs/promises");
-        const path = await import("path");
-        // If multiple images, append index to filename
-        const basePath = effectiveFileOutput!;
+        const filePaths = resolveFilePaths(effectiveFileOutput!, images, false);
         const responses = [];
         for (let i = 0; i < images.length; i++) {
-          const img = images[i];
-          let filePath = basePath;
-          if (images.length > 1) {
-            const parsed = path.parse(basePath);
-            filePath = path.join(parsed.dir, `${parsed.name}_${i + 1}.${img.ext ?? "png"}`);
-          } else {
-            // Ensure correct extension
-            const parsed = path.parse(basePath);
-            filePath = path.join(parsed.dir, `${parsed.name}.${img.ext ?? "png"}`);
-          }
-          await fs.writeFile(filePath, Buffer.from(img.b64, "base64"));
-          responses.push({ type: "text", text: `Image saved to: file://${filePath}` });
+          await fs.promises.writeFile(filePaths[i], Buffer.from(images[i].b64, "base64"));
+          responses.push({ type: "text", text: `Image saved to: file://${filePaths[i]}` });
         }
         return { content: responses };
       } else {
-        // Default: base64
         return {
           content: images.map((img) => ({
             type: "image",
@@ -197,30 +145,19 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
     }
   );
 
-  // Zod schema for edit-image tool input (gpt-image-1 only)
-  const absolutePathCheck = (val: string | undefined) => {
-    if (!val) return true;
-    // Check for Unix/Linux/macOS absolute paths
-    if (val.startsWith("/")) return true;
-    // Check for Windows absolute paths (C:/, D:\, etc.)
-    if (/^[a-zA-Z]:[/\\]/.test(val)) return true;
-    return false;
-  };
-  const base64Check = (val: string | undefined) => !!val && (/^([A-Za-z0-9+/=\r\n]+)$/.test(val) || val.startsWith("data:image/"));
-  const imageInputSchema = z.string().refine(
-    (val) => absolutePathCheck(val) || base64Check(val),
-    { message: "Must be an absolute path or a base64-encoded string (optionally as a data URL)" }
-  ).describe("Absolute path to an image file (png, jpg, webp < 25MB) or a base64-encoded image string.");
-
   // Base schema without refinement for server.tool signature
   const editImageBaseSchema = z.object({
     image: z.string().describe("Absolute image path or base64 string to edit."),
     prompt: z.string().max(32000).describe("A text description of the desired edit. Max 32000 chars."),
     mask: z.string().optional().describe("Optional absolute path or base64 string for a mask image (png < 4MB, same dimensions as the first image). Fully transparent areas indicate where to edit."),
-    model: z.literal("gpt-image-1").default("gpt-image-1"),
+    model: z.enum(["gpt-image-1", "gpt-image-2"]).default("gpt-image-2"),
     n: z.number().int().min(1).max(10).optional().describe("Number of images to generate (1-10)."),
-    quality: z.enum(["auto", "high", "medium", "low"]).optional().describe("Quality (high, medium, low) - only for gpt-image-1."),
-    size: z.enum(["1024x1024", "1536x1024", "1024x1536", "auto"]).optional().describe("Size of the generated images."),
+    quality: z.enum(["auto", "high", "medium", "low"]).optional().describe("Quality level: auto, high, medium, or low."),
+    size: z.string().optional().describe(
+      "Image size. For gpt-image-1: '1024x1024', '1536x1024', '1024x1536', or 'auto'. " +
+      "For gpt-image-2: any 'WxH' where both dimensions are multiples of 16, max edge 3840px, " +
+      "aspect ratio up to 3:1, total pixels between 655360 and 8294400."
+    ),
     user: z.string().optional().describe("Optional user identifier for OpenAI monitoring."),
     output: z.enum(["base64", "file_output"]).default("base64").describe("Output format: base64 or file path."),
     file_output: z.string().refine(absolutePathCheck, { message: "Path must be absolute" }).optional()
@@ -237,15 +174,13 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
     { message: "file_output must be an absolute path when output is 'file_output'", path: ["file_output"] }
   );
 
-  // Edit Image Tool (gpt-image-1 only)
+  // Edit Image Tool
   server.tool(
     "edit-image",
-    editImageBaseSchema.shape, // <-- Use the base schema shape here
+    editImageBaseSchema.shape,
     async (args, _extra) => {
-      // Validate arguments using the full schema with refinements
       const validatedArgs = editImageSchema.parse(args);
 
-      // Explicitly validate image and mask inputs here
       if (!absolutePathCheck(validatedArgs.image) && !base64Check(validatedArgs.image)) {
         throw new Error("Invalid 'image' input: Must be an absolute path or a base64-encoded string.");
       }
@@ -258,122 +193,71 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
         image: imageInput,
         prompt,
         mask: maskInput,
-        model = "gpt-image-1",
+        model = "gpt-image-2",
         n,
         quality,
         size,
         user,
         output = "base64",
         file_output: file_outputRaw,
-      } = validatedArgs; // <-- Use validatedArgs here
+      } = validatedArgs;
       const file_output: string | undefined = file_outputRaw;
 
-      // Helper to convert input (path or base64) to toFile
+      validateSize(size, model);
+
       async function inputToFile(input: string, idx = 0) {
         if (absolutePathCheck(input)) {
-          // File path: infer mime type from extension
-          const ext = input.split('.').pop()?.toLowerCase();
-          let mime = "image/png";
-          if (ext === "jpg" || ext === "jpeg") mime = "image/jpeg";
-          else if (ext === "webp") mime = "image/webp";
-          else if (ext === "png") mime = "image/png";
-          // else default to png
+          const mime = parseMimeFromExtension(input);
           return await toFile(fs.createReadStream(input), undefined, { type: mime });
         } else {
-          // Base64 or data URL
-          let base64 = input;
-          let mime = "image/png";
-          if (input.startsWith("data:image/")) {
-            // data URL
-            const match = input.match(/^data:(image\/\w+);base64,(.*)$/);
-            if (match) {
-              mime = match[1];
-              base64 = match[2];
-            }
-          }
+          const { base64, mime } = parseBase64DataUrl(input);
           const buffer = Buffer.from(base64, "base64");
           return await toFile(buffer, `input_${idx}.${mime.split("/")[1] || "png"}`, { type: mime });
         }
       }
 
-      // Prepare image input
       const imageFile = await inputToFile(imageInput, 0);
-
-      // Prepare mask input
       const maskFile = maskInput ? await inputToFile(maskInput, 1) : undefined;
 
-      // Construct parameters for OpenAI API
-      const editParams: any = {
-        image: imageFile,
+      const editParams = buildEditImageParams({
         prompt,
-        model, // Always gpt-image-1
-        ...(maskFile ? { mask: maskFile } : {}),
-        ...(n ? { n } : {}),
-        ...(quality ? { quality } : {}),
-        ...(size ? { size } : {}),
-        ...(user ? { user } : {}),
-        // response_format is not applicable for gpt-image-1 (always b64_json)
-      };
+        model,
+        n,
+        quality,
+        size,
+        user,
+        imageFile,
+        maskFile,
+      });
 
-      const result = await openai.images.edit(editParams);
+      const result = await openai.images.edit(editParams as any);
+      const images = mapEditImageResponse((result.data ?? []) as any);
 
-      // gpt-image-1 always returns base64 images in data[].b64_json
-      // We need to determine the output mime type and extension based on input/defaults
-      // Since OpenAI doesn't return this for edits, we'll default to png
-      const images = (result.data ?? []).map((img: any) => ({
-        b64: img.b64_json,
-        mimeType: "image/png",
-        ext: "png",
-      }));
-
-      // Auto-switch to file_output if total base64 size exceeds 1MB
-      const MAX_RESPONSE_SIZE = 1048576; // 1MB
-      const totalBase64Size = images.reduce((sum, img) => sum + Buffer.byteLength(img.b64, "base64"), 0);
-      let effectiveOutput = output;
-      let effectiveFileOutput = file_output;
-      if (output === "base64" && totalBase64Size > MAX_RESPONSE_SIZE) {
-        effectiveOutput = "file_output";
-        if (!file_output) {
-          // Use /tmp or MCP_HF_WORK_DIR if set
-          const tmpDir = process.env.MCP_HF_WORK_DIR || "/tmp";
-          const unique = Date.now();
-          effectiveFileOutput = path.join(tmpDir, `openai_image_edit_${unique}.png`);
-        }
-      }
+      const { effectiveOutput, effectiveFileOutput } = resolveOutputTarget({
+        output,
+        file_output,
+        images,
+        filenamePrefix: "openai_image_edit",
+        workDir: process.env.MCP_HF_WORK_DIR,
+      });
 
       if (effectiveOutput === "file_output") {
         if (!effectiveFileOutput) {
           throw new Error("file_output path is required when output is 'file_output'");
         }
-        // Use fs/promises and path (already imported)
-        const basePath = effectiveFileOutput!;
+        const filePaths = resolveFilePaths(effectiveFileOutput, images, true);
         const responses = [];
         for (let i = 0; i < images.length; i++) {
-          const img = images[i];
-          let filePath = basePath;
-          if (images.length > 1) {
-            const parsed = path.parse(basePath);
-            // Append index before the original extension if it exists, otherwise just append index and .png
-            const ext = parsed.ext || `.${img.ext}`;
-            filePath = path.join(parsed.dir, `${parsed.name}_${i + 1}${ext}`);
-          } else {
-            // Ensure the extension from the path is used, or default to .png
-            const parsed = path.parse(basePath);
-            const ext = parsed.ext || `.${img.ext}`;
-            filePath = path.join(parsed.dir, `${parsed.name}${ext}`);
-          }
-          await fs.promises.writeFile(filePath, Buffer.from(img.b64, "base64"));
-          // Workaround: Return file path as text
-          responses.push({ type: "text", text: `Image saved to: file://${filePath}` });
+          await fs.promises.writeFile(filePaths[i], Buffer.from(images[i].b64, "base64"));
+          responses.push({ type: "text", text: `Image saved to: file://${filePaths[i]}` });
         }
         return { content: responses };
       } else {
-        // Default: base64
         return {
           content: images.map((img) => ({
             type: "image",
             data: img.b64,
-            mimeType: img.mimeType, // Should be image/png
+            mimeType: img.mimeType,
           })),
         };
       }
@@ -382,4 +266,4 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-})(); 
+})();

@@ -12,6 +12,8 @@
     "openai": "^4.96.0"
   },
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "test": "tsc && node --test dist/utils.test.js dist/image-helpers.test.js",
+    "test:coverage": "tsc && node --experimental-test-coverage --test dist/utils.test.js dist/image-helpers.test.js"
   }
 }
