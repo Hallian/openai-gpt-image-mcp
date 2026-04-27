@@ -45,7 +45,7 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
   const createImageSchema = z.object({
     prompt: z.string().max(32000),
     background: z.enum(["transparent", "opaque", "auto"]).optional(),
-    model: z.enum(["gpt-image-1", "gpt-image-2"]).default("gpt-image-1"),
+    model: z.enum(["gpt-image-1", "gpt-image-2"]).default("gpt-image-2"),
     moderation: z.enum(["auto", "low"]).optional(),
     n: z.number().int().min(1).max(10).optional(),
     output_compression: z.number().int().min(0).max(100).optional(),
@@ -91,7 +91,7 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
       const openai = process.env.AZURE_OPENAI_API_KEY ? new AzureOpenAI() : new OpenAI();
 
       const {
-        model = "gpt-image-1",
+        model = "gpt-image-2",
         background,
         output_format,
         output = "base64",
@@ -150,7 +150,7 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
     image: z.string().describe("Absolute image path or base64 string to edit."),
     prompt: z.string().max(32000).describe("A text description of the desired edit. Max 32000 chars."),
     mask: z.string().optional().describe("Optional absolute path or base64 string for a mask image (png < 4MB, same dimensions as the first image). Fully transparent areas indicate where to edit."),
-    model: z.enum(["gpt-image-1", "gpt-image-2"]).default("gpt-image-1"),
+    model: z.enum(["gpt-image-1", "gpt-image-2"]).default("gpt-image-2"),
     n: z.number().int().min(1).max(10).optional().describe("Number of images to generate (1-10)."),
     quality: z.enum(["auto", "high", "medium", "low"]).optional().describe("Quality level: auto, high, medium, or low."),
     size: z.string().optional().describe(
@@ -193,7 +193,7 @@ if (envFileArgIndex !== -1 && cmdArgs[envFileArgIndex + 1]) {
         image: imageInput,
         prompt,
         mask: maskInput,
-        model = "gpt-image-1",
+        model = "gpt-image-2",
         n,
         quality,
         size,

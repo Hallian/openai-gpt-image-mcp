@@ -62,7 +62,7 @@ Also supports Azure deployments:
     "openai-gpt-image-mcp": {
       "command": "node",
       "args": ["/absolute/path/to/dist/index.js"],
-      "env": { 
+      "env": {
         "AZURE_OPENAI_API_KEY": "sk-...",
         "AZURE_OPENAI_ENDPOINT": "my.endpoint.com",
         "OPENAI_API_VERSION": "2024-12-01-preview"
@@ -91,7 +91,7 @@ Also supports supplying an environment files:
 
 ### Model Selection
 
-Both tools default to `gpt-image-1`. Pass `model: "gpt-image-2"` to use the newer model:
+Both tools default to `gpt-image-2`. Pass `model: "gpt-image-1"` to use the older model:
 
 - **gpt-image-2** supports custom image sizes (any `WxH` where both dimensions are multiples of 16, max edge 3840px, aspect ratio up to 3:1, total pixels between 655,360 and 8,294,400). Common sizes: `1024x1024`, `1536x1024`, `1792x1024`, `2048x2048`.
 - **gpt-image-2** does **not** support transparent backgrounds (the `background` parameter is ignored).
